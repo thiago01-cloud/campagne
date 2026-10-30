@@ -1,0 +1,318 @@
+// CAMPAGNES — database schema.
+//
+// Database: PostgreSQL (Neon via Vercel), like TASKS — the project
+// started on SQLite locally and switched to PostgreSQL for the Vercel
+// deployment (see README). Same conventions as TASKS:
+//   - "enum" fields (role, status, channel...) are plain String, with the
+//     allowed values listed in a comment and validated in code
+//     (lib/enums.ts), as in TASKS.
+//   - JSON payloads are stored as String and parsed with lib/json.ts, so
+//     the schema works unchanged on SQLite and PostgreSQL.
+//
+// Accounts/companies follow the same pattern as TASKS (and houses): a
+// "User" is a pure login account, a "Company" is owned directly by a User
+// (ownerId), and an "Agent" links a User to a Company as staff, with a
+// role scoped to that company. A User can own several companies and/or be
+// an Agent in others. Everything else (groups, lists, campaigns,
+// exclusion list, settings, audit log) belongs to one company — deleting
+// a company cascades to all of it.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled connection (app)
+  directUrl = env("DATABASE_URL_UNPOOLED") // direct connection (migrations)
+}
+
+// ---------- Accounts & companies ----------
+
+// Login account, independent of any company.
+model User {
+  id            String    @id @default(cuid())
+  firstName     String
+  lastName      String
+  country       String // ISO 3166-1 alpha-2 — see lib/countries.ts
+  phone         String    @unique // international format, e.g. "+24177000000"
+  email         String?   @unique // lowercased
+  passwordHash  String
+  // Null until the account has chosen its own password — accounts added
+  // from the team page get an invite link instead (lib/invite.ts).
+  passwordSetAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  ownedCompanies    Company[]          @relation("CompanyOwner")
+  agentRoles        Agent[]
+  pushSubscriptions PushSubscription[]
+
+  @@map("users")
+}
+
+model Company {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String
+  owner     User     @relation("CompanyOwner", fields: [ownerId], references: [id])
+  createdAt DateTime @default(now())
+
+  agents       Agent[]
+  groups       Group[]
+  lists        ContactList[]
+  campaigns    Campaign[]
+  unsubscribes Unsubscribe[]
+  auditLogs    AuditLog[]
+  settings     Settings?
+
+  @@map("companies")
+}
+
+// Links a User to a Company as staff. role (scoped to this company):
+//   "ADMIN"   — administrateur : everything, accounts and groups
+//   "MANAGER" — chef de groupe : leads groups, adds agents to them
+//   "AGENT"   — agent : imports lists, creates and launches campaigns
+//   "VIEWER"  — lecteur : read-only access
+// The company owner gets an ADMIN Agent record at creation and is shown as
+// "Propriétaire" (session role "OWNER" — see lib/auth.ts).
+model Agent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  role      String   @default("AGENT")
+  // Blocked rather than removed: a blocked agent can no longer open this
+  // company, but their lists/campaigns/history stay intact.
+  active    Boolean  @default(true)
+  joinedAt  DateTime @default(now())
+
+  createdByAgentId String?
+  createdBy        Agent?  @relation("AgentCreator", fields: [createdByAgentId], references: [id], onDelete: SetNull)
+  createdAgents    Agent[] @relation("AgentCreator")
+
+  groups        Group[]        @relation("GroupMembers")
+  ledGroups     Group[]        @relation("GroupLeader")
+  createdGroups Group[]        @relation("GroupCreator")
+  lists         ContactList[]
+  campaigns     Campaign[]
+  notifications Notification[]
+  auditLogs     AuditLog[]
+
+  @@unique([userId, companyId])
+  @@map("agents")
+}
+
+// A team within a company, named freely, with one "chef" (leader) and its
+// agents. The leader is the direct superior of every member: they see the
+// members' lists and campaigns and receive their campaign notifications
+// (see lib/team.ts).
+model Group {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime @default(now())
+
+  leaderId String?
+  leader   Agent?  @relation("GroupLeader", fields: [leaderId], references: [id], onDelete: SetNull)
+
+  createdById String?
+  createdBy   Agent?  @relation("GroupCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  members Agent[] @relation("GroupMembers")
+
+  @@map("groups")
+}
+
+// ---------- Contacts ----------
+
+model ContactList {
+  id                String   @id @default(cuid())
+  companyId         String
+  company           Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name              String
+  sourceFile        String
+  sheet             String?
+  columns           String // JSON string[] — keys built from the file's headers
+  phoneColumn       String?
+  emailColumn       String?
+  rowCount          Int
+  validCount        Int
+  rejectedCount     Int
+  duplicateCount    Int
+  unsubscribedCount Int
+  createdById       String
+  createdBy         Agent    @relation(fields: [createdById], references: [id])
+  createdAt         DateTime @default(now())
+
+  contacts  Contact[]
+  campaigns Campaign[]
+
+  @@index([companyId])
+  @@map("contact_lists")
+}
+
+model Contact {
+  id           String      @id @default(cuid())
+  listId       String
+  list         ContactList @relation(fields: [listId], references: [id], onDelete: Cascade)
+  row          Int // line number in the original file
+  phone        String?
+  email        String?
+  data         String // JSON { header: value } — every column of the original row
+  valid        Boolean
+  rejectReason String?
+
+  sends Send[]
+
+  @@index([listId, valid])
+  @@map("contacts")
+}
+
+// ---------- Campaigns ----------
+
+// channel: "SMS" | "EMAIL" | "BOTH"
+// status:  "DRAFT" | "SCHEDULED" | "PREPARING" | "SENDING" | "COMPLETED" | "CANCELLED"
+model Campaign {
+  id               String       @id @default(cuid())
+  companyId        String
+  company          Company      @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name             String
+  channel          String
+  listId           String?
+  list             ContactList? @relation(fields: [listId], references: [id], onDelete: SetNull)
+  smsMessage       String?
+  stopMention      Boolean      @default(false)
+  emailSubject     String?
+  emailSender      String?
+  emailBody        String?
+  status           String       @default("DRAFT")
+  launchedAt       DateTime? // when the launch was confirmed
+  scheduledAt      DateTime? // when sending must start (= launchedAt for an immediate launch)
+  startedAt        DateTime?
+  completedAt      DateTime?
+  consentConfirmed Boolean      @default(false)
+  createdById      String
+  createdBy        Agent        @relation(fields: [createdById], references: [id])
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  sends Send[]
+
+  @@index([companyId, status])
+  @@map("campaigns")
+}
+
+// One message to one recipient on one channel — also the send queue
+// itself (status "PENDING"), processed by lib/queue.ts.
+// channel: "SMS" | "EMAIL" — status: "PENDING" | "SENT" | "DELIVERED" | "FAILED"
+model Send {
+  id            String    @id @default(cuid())
+  campaignId    String
+  campaign      Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contactId     String?
+  contact       Contact?  @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  channel       String
+  recipient     String
+  status        String    @default("PENDING")
+  providerId    String?
+  error         String?
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime? // retry time after a temporary error
+  lockedAt      DateTime? // taken by a queue run in progress
+  createdAt     DateTime  @default(now())
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  openedAt      DateTime?
+
+  @@index([campaignId, status])
+  @@index([status, nextAttemptAt])
+  @@index([providerId])
+  @@index([recipient])
+  @@index([sentAt])
+  @@map("sends")
+}
+
+// Exclusion list of a company, per channel ("SMS" | "EMAIL").
+model Unsubscribe {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  phone     String?
+  email     String?
+  channel   String
+  source    String?
+  createdAt DateTime @default(now())
+
+  @@index([companyId, phone])
+  @@index([companyId, email])
+  @@map("unsubscribes")
+}
+
+// ---------- Notifications ----------
+
+// In-app notification for an agent (company-scoped, like TASKS).
+model Notification {
+  id        String   @id @default(cuid())
+  agentId   String
+  agent     Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  type      String // see NOTIFICATION_TYPE_LABELS in lib/enums.ts
+  title     String
+  body      String?
+  url       String?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([agentId, read])
+  @@map("notifications")
+}
+
+// One row per browser/device a user turned push notifications on for (see
+// lib/push.ts and public/sw.js). Tied to the login account rather than to
+// one company, since a device belongs to a person whatever company they
+// are working in.
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  @@map("push_subscriptions")
+}
+
+// ---------- Administration ----------
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  agentId   String?
+  agent     Agent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  action    String
+  target    String?
+  details   String? // JSON
+  createdAt DateTime @default(now())
+
+  @@index([companyId, createdAt])
+  @@map("audit_logs")
+}
+
+// Settings of a company (created on first read — see lib/settings.ts).
+model Settings {
+  id            String  @id @default(cuid())
+  companyId     String  @unique
+  company       Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  dialCode      String  @default("241")
+  dailyCap      Int     @default(10000)
+  ratePerSecond Int     @default(10)
+  stopMention   String  @default("STOP au 0000")
+  defaultSender String?
+  maxFileMb     Int     @default(10)
+  maxContacts   Int     @default(50000)
+
+  @@map("settings")
+}
